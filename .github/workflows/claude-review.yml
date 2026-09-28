@@ -1,0 +1,75 @@
+name: claude-review
+
+# Automated PR review by Claude Code (anthropics/claude-code-action), billed per
+# use to the Anthropic API account behind the ANTHROPIC_API_KEY repo secret.
+# Until that secret is set, the job skips instead of failing every PR.
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Skip drafts, and PRs from forks (they cannot read the secret).
+    if: >-
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+    steps:
+      # Secrets cannot appear in an `if:`, so test for the key here.
+      - name: Check for API key
+        id: key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::ANTHROPIC_API_KEY secret not set; skipping Claude review."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.present == 'true'
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        if: steps.key.outputs.present == 'true'
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request. If the repo has a CLAUDE.md, read it
+            first: any rule it states that the change breaks is a blocking
+            finding. Otherwise use the README to understand the project.
+
+            Focus on correctness bugs first, then security problems (secrets,
+            credentials or API keys committed or hardcoded), then anything
+            else worth a human's attention. Skip style nits.
+
+            Use `gh pr diff` and `gh pr view` to read the change. Post
+            line-specific findings with the inline comment tool, and always
+            finish with exactly one short summary via `gh pr comment`, even
+            when nothing is wrong (then say so in one line).
+          claude_args: >-
+            --model claude-sonnet-5-5
+            --allowed-tools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
+
+      # The action hides Claude's output, so a failed run (e.g. a rejected
+      # API key) otherwise shows only "is_error: true". Print just the final
+      # result message, which carries the error text.
+      - name: Show Claude error
+        if: failure() && steps.key.outputs.present == 'true'
+        run: |
+          jq -r '.. | objects | select(.type? == "result") | .result? // empty' \
+            "$RUNNER_TEMP/claude-execution-output.json" || true
